@@ -1,0 +1,45 @@
+name: retrain
+on:
+  schedule:
+    - cron: "43 3 * * 1"   # weekly, Monday 03:43 UTC
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: warehouse
+  cancel-in-progress: false
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ABUSELENS_DB: data/abuselens.duckdb
+      ABUSELENS_MODEL_DIR: data/models
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .
+      - name: Download warehouse and the previous champion model
+        run: |
+          mkdir -p data
+          gh release download warehouse -p abuselens.duckdb -D data --clobber
+          gh release download warehouse -p models.tgz -D data --clobber && tar -xzf data/models.tgz -C data || echo "no champion yet"
+      - name: Build marts, retrain, compare to champion, monitor, report
+        run: |
+          abuselens marts
+          abuselens train
+          abuselens monitor
+          abuselens report
+      - name: Publish champion model and weekly brief
+        run: |
+          tar -czf data/models.tgz -C data models
+          gh release upload warehouse data/models.tgz --clobber
+          gh release upload warehouse data/reports/*.md --clobber
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weekly-brief
+          path: data/reports/

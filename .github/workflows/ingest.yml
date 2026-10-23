@@ -1,0 +1,43 @@
+name: ingest
+on:
+  schedule:
+    - cron: "17 2 * * *"   # daily, 02:17 UTC
+  workflow_dispatch:
+permissions:
+  contents: write           # lets the job publish the warehouse as a release asset
+concurrency:
+  group: warehouse           # never let two runs write the warehouse at once
+  cancel-in-progress: false
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ABUSELENS_DB: data/abuselens.duckdb
+      ABUSECH_AUTH_KEY: ${{ secrets.ABUSECH_AUTH_KEY }}
+      PHISHTANK_API_KEY: ${{ secrets.PHISHTANK_API_KEY }}
+      SAFE_DOMAINS_PER_DAY: "600"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e .
+      - name: Download warehouse from the 'warehouse' release (skipped on first run)
+        run: |
+          mkdir -p data
+          gh release download warehouse -p abuselens.duckdb -D data --clobber || echo "no warehouse yet, starting fresh"
+      - name: Pull feeds, validate, load
+        run: abuselens ingest --sources urlhaus openphish tranco sitelinks
+      - name: PhishTank (only when a key is configured)
+        if: env.PHISHTANK_API_KEY != ''
+        run: abuselens ingest --sources phishtank
+      - name: Build marts
+        run: abuselens marts
+      - name: Publish updated warehouse
+        run: |
+          gh release view warehouse >/dev/null 2>&1 || \
+            gh release create warehouse --title "warehouse" --notes "Latest AbuseLens DuckDB warehouse (overwritten by the daily ingest)."
+          gh release upload warehouse data/abuselens.duckdb --clobber
