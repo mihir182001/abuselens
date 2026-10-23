@@ -1,8 +1,37 @@
-# AbuseLens — Real-Time Malicious URL Detection & Abuse Trend Analytics
+# AbuseLens: Malicious URL Detection & Abuse Trend Analytics
 
 A pipeline that runs itself every day: it collects **real** malicious URLs from live abuse feeds, stores
 them in a SQL warehouse (DuckDB), finds trends and attack campaigns, scores URLs with a calibrated
 machine-learning model, and reports the way a Trust & Safety analyst would.
+
+**What it found (real data, 21 Sep to 22 Oct 2026):**
+- About 40% of the malware URLs are files hosted on **GitHub alone**, and Google Drive, Discord and Dropbox
+  show up in the top campaigns. Attackers are abusing trusted platforms, so blocking by domain would not work.
+- Median malware URL stays live **301 hours (about 12.5 days)**; 52% are still online after 7 days.
+- Detector at a 1% false-positive budget catches **98.1% of malware**; precision at an assumed 1% real-world
+  prevalence is **58.8%** (high AUC does not mean high precision when abuse is rare).
+- Recall on genuinely unseen later weeks stayed flat (98.2% to 98.5%), so no model decay is visible yet.
+
+Full write-up of decisions, bugs found and limits: [docs/interview_story.md](docs/interview_story.md).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[URLhaus<br/>OpenPhish<br/>PhishTank] --> Q
+    B[Tranco ranks +<br/>real site links] --> Q
+    Q{Quality gates<br/>schema, dups, volume,<br/>freshness} -->|pass| R[(DuckDB raw<br/>daily snapshots)]
+    Q -->|fail| L[ingest_log]
+    R --> S[SQL staging] --> M[SQL marts<br/>trends, brands, TLDs,<br/>campaigns, takedown]
+    S --> F[Lexical features<br/>one code path] --> X[XGBoost +<br/>isotonic calibration]
+    X --> C{Champion vs<br/>challenger}
+    C --> API[FastAPI /score]
+    M --> D[Streamlit dashboard]
+    X --> P[PSI drift +<br/>weekly decay]
+    M --> W[Weekly risk brief]
+    P --> W
+    GH[GitHub Actions<br/>daily ingest, weekly retrain] -.runs.-> Q
+```
 
 ## Data sources (no synthetic data in the pipeline)
 
@@ -24,7 +53,7 @@ python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\
 pip install -e ".[dev,dashboard]"
 export ABUSECH_AUTH_KEY=...         # free key from https://auth.abuse.ch/ (required for URLhaus)
 export PHISHTANK_API_KEY=...        # optional; PhishTank registration may be closed
-abuselens ingest --sources urlhaus openphish tranco   # fetch -> validate -> load (one snapshot per day)
+abuselens ingest --sources urlhaus openphish tranco sitelinks   # fetch -> validate -> load (one snapshot per day)
 abuselens marts                     # build staging + mart tables
 abuselens train                     # per-type time split, calibrate, champion/challenger
 abuselens evaluate                  # results by abuse type + top features
@@ -43,28 +72,52 @@ Tune with `SAFE_DOMAINS_PER_DAY`, `CC_URLS_PER_DOMAIN`, `CC_TIME_BUDGET_S`.
 **Important:** time-based validation and decay charts need several days of accumulated snapshots.
 Start the daily `ingest.yml` workflow early.
 
-## Results (first run, 22 Oct 2026, single-day snapshot)
+## Results
 
-Data: 35,983 URLhaus malware URLs, 600 OpenPhish phishing URLs, 13,252 safe URLs (real links from 5,000
-sampled Tranco sites, ranks 1,000-1,000,000). Operating point: threshold chosen for ~1% false-positive rate.
+Data window: 21 Sep to 22 Oct 2026. About 36,000 URLhaus malware URLs, 600 OpenPhish phishing URLs and
+13,000+ safe URLs (real internal links of 5,000 sampled Tranco sites, ranks 1,000 to 1,000,000). The
+operating threshold is chosen on a calibration slice for a 1% false-positive rate.
+
+**Current champion model (time-based hold-out of the newest data):**
+
+| Metric | Value |
+|---|---|
+| PR-AUC / ROC-AUC | 0.998 / 0.997 |
+| Recall at the frozen threshold | 98.1% |
+| Safe URLs wrongly flagged | 0.69% |
+| Precision at assumed 1% prevalence | 58.8% |
+
+**Breakdown by abuse type (earlier evaluation, same pipeline):**
 
 | Evaluation | Safe wrongly flagged | Malware caught | Phishing caught | Phishing ROC-AUC |
 |---|---|---|---|---|
 | Per-type time split (n_phish_test=150) | 0.97% | 98.5% | 88.7% | 0.985 |
 | Strict host-disjoint (n_phish_test=127) | 1.68% | 98.9% | 87.4% | 0.987 |
 
+**Accuracy over time (frozen model, only URLs newer than each type's training data):**
+
+| Week starting | Held-out malware URLs | Recall |
+|---|---|---|
+| 5 Oct | 1,741 | 98.3% |
+| 12 Oct | 3,878 | 98.2% |
+| 19 Oct | 3,372 | 98.5% |
+
 Reading these honestly:
+- PR-AUC looks near-perfect because the test set is far more malicious than the real world. Use the
+  precision-at-prevalence number for real-world expectations.
 - Phishing barely drops when no host is shared between train and test, so the result is not mainly
   memorised phishing kits.
 - Most feature importance sits on malware-style signals (`digit_ratio_url`, `has_exec_ext`,
   `n_digits_host`); the model is mainly a malware-URL detector with useful phishing detection on top.
-- Phishing test sets are small (~130-150 URLs), so treat phishing figures as +/- several points.
-- The strict split leaves a small calibration slice, which makes its threshold (and FPR) noisy.
-- All phishing URLs come from one feed on one day; there is no real time-based phishing test yet.
-  Re-run `evaluate` as daily snapshots accumulate.
-- A first-split bug is worth telling: a single global time cut put every OpenPhish URL (all stamped
-  with the pull date) in the test set, so the first model had never seen phishing (recall 70%).
-  Splitting per abuse type fixed it (recall 89%).
+- Phishing test sets are small (about 130 to 150 URLs), so treat phishing figures as +/- several points.
+- Malware input features show drift (PSI about 0.35 on host-shape features) while recall stays flat: the
+  host mix is shifting but the model is coping. Phishing drift is not assessed until 7 days of data exist.
+- All phishing URLs currently come from one feed. The daily run adds days of data for a real time-based
+  phishing test.
+- Two bugs worth telling: a single global time cut put every OpenPhish URL in the test set (recall 70%
+  until splitting per abuse type), and the first decay table scored training rows, overstating a decline.
+
+<!-- Add dashboard screenshots: save PNGs to docs/img/ and embed with ![Trends](docs/img/trends.png) -->
 
 ## Design decisions
 
@@ -100,13 +153,15 @@ dashboard/   tests/   docs/   .github/workflows/{ingest,retrain,ci}.yml
 5. Enrichment features are only used if they cover >30% of training rows.
 6. Feed endpoints/terms can change (abuse.ch auth, PhishTank keys); check each provider's terms of use.
 
-## Interview story
+## Interview story (short version)
 
 - **Label bias, and the fix:** popular domains are trivially "safe", so a naive model learns *unpopular =
-  malicious*. Safe examples come from lower-ranked Tranco domains plus real Common Crawl paths.
-- **Accuracy over time:** `abuselens monitor` shows recall at a frozen threshold by week — the decay curve is
-  attackers adapting, and it motivates the weekly retrain.
-- **Real findings:** most impersonated brands this month; which hosts are slowest to remove malware.
+  malicious*. Safe examples come from lower-ranked Tranco domains plus real internal links from their pages.
+- **Accuracy over time:** `abuselens monitor` scores only URLs newer than the training data at a frozen
+  threshold. Flat recall means no decay yet; a falling curve would mean attackers adapting.
+- **Real findings:** abuse of trusted file hosts, slow malware takedown, campaigns reusing one URL template.
+
+More detail, likely questions and honest limits: [docs/interview_story.md](docs/interview_story.md).
 
 ## Scheduled runs
 Daily ingest and weekly retrain run on GitHub Actions; setup steps are in [docs/automation.md](docs/automation.md).
